@@ -1,0 +1,9 @@
+numpy
+pygame
+
+[dev]
+torch>=2.0
+pygame
+
+[torch]
+torch>=2.0

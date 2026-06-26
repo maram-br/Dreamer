@@ -1,0 +1,34 @@
+# ==============================================================================
+# requirements.txt -- S-DBS Dreamer-PPO
+# ==============================================================================
+#
+# Installation (PC local, développement / mode mock) :
+#   pip install -r requirements.txt
+#
+# NE PAS installer `carla` ici -- ce module n'est nécessaire que sur le
+# serveur où tourne réellement CARLA, pour collect_carla_driving_data.py en
+# mode réel (--host). Sur ton PC, le mode --mock n'en a pas besoin, et le
+# reste du projet (training, pretraining, visualisation) ne l'importe jamais.
+# Voir la note CARLA en bas de ce fichier.
+# ==============================================================================
+
+numpy>=1.24                # calculs, états, buffers (PER, RolloutBuffer, etc.)
+                           # testé avec numpy 2.4.4 -- aucun souci de compatibilité
+torch>=2.0                 # PPO, WorldModel (GRU), ActorCritic
+                           # -- sans torch, run_training.py et sdbs_core.py
+                           #    retombent automatiquement sur le smoke test
+                           #    NumPy pur (run_core_smoke_test), mais aucun
+                           #    entraînement réel n'est possible
+                           # testé avec torch 2.12.1
+pygame>=2.5                # visualize_greedy_vs_sdbs.py uniquement
+                           # testé avec pygame 2.6.1
+
+# ------------------------------------------------------------------------------
+# CARLA (serveur uniquement, PAS sur ce PC) :
+#
+#   pip install <CARLA_ROOT>/PythonAPI/carla/dist/carla-<version>-<tag>.whl
+#
+# Vérifie la compatibilité de version Python du serveur avant d'installer.
+# Teste avec :
+#   python3 -c "import carla; c=carla.Client('localhost',2000); c.set_timeout(10); print(c.get_server_version())"
+# ------------------------------------------------------------------------------
