@@ -2,7 +2,7 @@ Metadata-Version: 2.4
 Name: sdbs
 Version: 0.1.0
 Summary: S-DBS Dreamer-PPO: Safe Diverse Beam Search for Autonomous Driving
-Requires-Python: >=3.10
+Requires-Python: >=3.8
 Requires-Dist: numpy
 Requires-Dist: pygame
 Provides-Extra: torch
