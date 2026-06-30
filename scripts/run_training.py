@@ -237,7 +237,57 @@ def run_mock_training(args):
     print(f"\nOK Training termine en {elapsed:.1f}s")
     print("Pour passer sur CARLA : remplace EnhancedMockEnv par CarlaEnvAdapter")
     print("et relance avec --mode carla --device cuda")
-
+def run_highway_training(args):
+    if not HAS_TORCH:
+        print("PyTorch requis pour le mode highway.")
+        return
+ 
+    from sdbs.model.sdbs_dreamer import train
+    from sdbs.viz.highway_env_adapter import HighwayEnvAdapter, highway_ego_xy, highway_mandated_action
+ 
+    print("\n" + "=" * 60)
+    print("S-DBS Dreamer-PPO — Mode highway-env")
+    print("=" * 60)
+ 
+    env = HighwayEnvAdapter(seed=args.seed)
+    cfg = make_config(smoke=args.smoke)
+ 
+    print(f"Env       : HighwayEnvAdapter  state_dim={env.state_dim}  "
+          f"action_dim={env.action_dim}")
+    print(f"Device    : {args.device}")
+    print(f"Iterations: {args.iters}")
+ 
+    wm_state = policy_state = ensemble_state = None
+    if args.wm_checkpoint:
+        state_dicts = load_world_model_checkpoint(args.wm_checkpoint, args.device)
+        wm_state = state_dicts.get("wm")
+        policy_state = state_dicts.get("policy")
+        ensemble_state = state_dicts.get("ensemble")
+ 
+    import time
+    t0 = time.time()
+    train(
+        env=env,
+        cfg=cfg,
+        n_iterations=args.iters,
+        rollout_size=cfg.rollout_size,
+        use_ensemble=not args.no_ensemble,
+        ego_xy_fn=highway_ego_xy,
+        mandated_action_fn=highway_mandated_action,
+        device=args.device,
+        seed=args.seed,
+        verbose=True,
+        save_every=args.save_every,
+        save_path=args.save_path,
+        wm_state=wm_state,
+        policy_state=policy_state,
+        ensemble_state=ensemble_state,
+        resume_path=args.resume,
+        eval_every=args.eval_every,
+    )
+    elapsed = time.time() - t0
+    print(f"\nOK Training highway-env termine en {elapsed:.1f}s")
+ 
 def run_carla_training(args):
     if not HAS_TORCH:
         print("PyTorch requis pour le mode carla.")
@@ -371,7 +421,7 @@ def run_ablation_demo():
 # ==============================================================================
 def parse_args():
     p = argparse.ArgumentParser(description="S-DBS Dreamer-PPO training")
-    p.add_argument("--mode",          default="mock", choices=["mock", "carla"])
+    p.add_argument("--mode", default="mock", choices=["mock", "carla", "highway"])
     p.add_argument("--smoke",         action="store_true",
                    help="3 itÃ©rations, rollout court â€” vÃ©rifie que tout se branche")
     p.add_argument("--ablation",      action="store_true",
@@ -425,6 +475,8 @@ def main():
         run_mock_training(args)
     elif args.mode == "carla":
         run_carla_training(args)
+    elif args.mode == "highway":
+        run_highway_training(args)
 
 
 if __name__ == "__main__":

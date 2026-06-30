@@ -467,28 +467,27 @@ def enhanced_ego_xy(state: np.ndarray):
 
 
 def enhanced_mandated_action(state: np.ndarray, info: dict) -> Optional[np.ndarray]:
-    """
-    Hard safety floor (Sec. 6 essential actions).
-    Priority order: collision-imminent brake > red light stop > yield ROW.
-    Returns np.ndarray([steer, throttle, brake]) or None.
-    """
     FULL_BRAKE = np.array([0.0, 0.0, 1.0], dtype=np.float32)
     SOFT_BRAKE = np.array([0.0, 0.0, 0.4], dtype=np.float32)
 
     min_ttc = float(info.get("min_ttc", 99.0))
+    speed = float(state[IDX_SPEED])
 
-    # Emergency: imminent collision
+    # Si l'ego est déjà quasi à l'arrêt, ne pas re-déclencher le frein
+    # d'urgence : un TTC figé à cause d'une vitesse nulle ne doit pas
+    # provoquer un freinage permanent (deadlock).
+    if speed < 0.5:
+        return None
+
     if min_ttc < 1.0:
         return FULL_BRAKE
 
-    # Red light or stop sign — stop if still moving
-    if float(state[IDX_TL]) > 0.5 and float(state[IDX_SPEED]) > 0.5:
-        return FULL_BRAKE if float(state[IDX_SPEED]) > 4.0 else SOFT_BRAKE
+    if float(state[IDX_TL]) > 0.5 and speed > 0.5:
+        return FULL_BRAKE if speed > 4.0 else SOFT_BRAKE
 
-    if float(state[IDX_STOP]) > 0.5 and float(state[IDX_SPEED]) > 0.5:
+    if float(state[IDX_STOP]) > 0.5 and speed > 0.5:
         return SOFT_BRAKE
 
-    # Yield when ROW is not ours and a VRU is close
     if float(state[IDX_ROW]) < 0.5 and min_ttc < 3.0:
         return SOFT_BRAKE
 

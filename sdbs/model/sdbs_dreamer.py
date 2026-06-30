@@ -28,6 +28,20 @@ Contributions supplémentaires (au-delà du papier de référence) :
                                  via step_info["agent_observations"]
   * build_agent ................ instancie et câble le MultiAgentPredictor au
                                  SDBSPlanner (lambda_collision dans PlannerConfig)
+
+R8 · Squashed Gaussian action bound fix
+  * ActorCritic.control_mean previously fed straight into Normal(mean, std)
+    with NO final activation, so sampled actions were unbounded on R (e.g.
+    [3.7, 0.6], [-1.7, -4.7] observed in logs) even though every consumer
+    (EnhancedMockEnv, highway-env) expects actions in [-1, 1]. EnhancedMockEnv
+    silently clips on receipt, which masked the bug but desynchronised the
+    PPO importance ratio: log_prob was computed under the *unbounded* Normal
+    for an action that was NOT the one actually executed after clipping.
+    Fixed here with a squashed Gaussian: sample u ~ Normal(mean, std) on R,
+    execute a = tanh(u) in (-1,1), and correct the log-prob by the tanh
+    Jacobian: log pi(a) = log N(u; mean, std) - sum log(1 - tanh(u)^2).
+    This makes log_prob consistent with the action actually sent to the env,
+    which PPO's ratio = exp(logp_new - logp_old) requires to be unbiased.
 ================================================================================
 """
 
@@ -103,6 +117,33 @@ if HAS_TORCH:
             return torch.clamp((x - self.mean) / std, -self.clip, self.clip)
 
     # ==========================================================================
+    # 0b.  Squashed Gaussian helper  (R8 fix)
+    # ==========================================================================
+    # Numerical safety margin: tanh saturates to exactly +/-1.0 in float32 well
+    # before the underlying pre-squash value is actually infinite, which would
+    # make log(1 - tanh(u)^2) -> log(0) -> -inf and poison the loss. Clamping
+    # the squashed action away from the boundary keeps the correction term
+    # finite without perceptibly biasing the action itself.
+    _TANH_EPS = 1e-6
+
+    def _squash(u: torch.Tensor) -> torch.Tensor:
+        return torch.tanh(u)
+
+    def _squash_log_prob(u: torch.Tensor, normal: "Normal") -> torch.Tensor:
+        """log pi(a=tanh(u)) where u ~ normal, summed over the action dims.
+
+        Standard SAC-style correction:
+            log pi(a) = log N(u) - sum_i log(1 - tanh(u_i)^2)
+        computed in a numerically stable form via softplus rather than naively
+        evaluating 1 - tanh(u)^2 (which underflows to 0 for |u| >~ 4, well
+        within the range an untrained policy's mean/std can produce).
+        """
+        log_prob_u = normal.log_prob(u).sum(-1)
+        # log(1 - tanh(u)^2) = 2*(log(2) - u - softplus(-2u)), the stable form
+        correction = (2.0 * (math.log(2.0) - u - F.softplus(-2.0 * u))).sum(-1)
+        return log_prob_u - correction
+
+    # ==========================================================================
     # 1.  Actor-Critic with a maneuver (option) head  (Sec. 5)
     # ==========================================================================
     class ActorCritic(nn.Module):
@@ -110,8 +151,14 @@ if HAS_TORCH:
             * a discrete *maneuver* head pi(m | o)         (the option level), and
             * a continuous *control* head pi(a | o, m)     conditioned on the maneuver,
             * a shared critic V(o).
-        Actions are (steer, throttle, brake, ...); squashing/clipping to actuator
-        ranges should be applied by the environment or added here as a tanh head."""
+
+        R8 · Control actions are bounded to (-1, 1) via a squashed Gaussian:
+        the network parametrises Normal(mean, std) over an UNBOUNDED pre-squash
+        variable u; the executed action is a = tanh(u). log_prob is corrected
+        by the tanh Jacobian everywhere an action is sampled or evaluated, so
+        PPO's importance ratio stays consistent with what was actually sent to
+        the environment. Callers that need the pre-squash mean/std directly
+        (e.g. for diagnostics) can still get them from `_control_dist`."""
 
         def __init__(self, state_dim: int, action_dim: int, n_maneuvers: int,
                      hidden: int = 256):
@@ -143,6 +190,10 @@ if HAS_TORCH:
             return self.critic(self.features(s)).squeeze(-1)
 
         def _control_dist(self, h, maneuver_onehot):
+            """Returns the PRE-squash Normal(mean, std) over u in R^action_dim.
+            Callers must apply tanh (and the matching log-prob correction) to
+            get the actual bounded action -- see `act`, `act_with_maneuver`,
+            `evaluate` below, which all do this consistently."""
             x = torch.cat([h, maneuver_onehot], dim=-1)
             mean = self.control_mean(x)
             std = self.control_logstd.exp().expand_as(mean)
@@ -150,38 +201,58 @@ if HAS_TORCH:
 
         # --- sampling ---
         def act(self, s):
-            """Sample maneuver then control. Returns (m, a, logp, value)."""
+            """Sample maneuver then control. Returns (m, a, logp, value), where
+            `a` is already squashed to (-1, 1) and `logp` is the corresponding
+            corrected log-probability (maneuver logp + squashed control logp)."""
             h = self.features(s)
             m_dist = Categorical(logits=self.maneuver_head(h))
             m = m_dist.sample()
             onehot = F.one_hot(m, self.n_maneuvers).float()
             c_dist = self._control_dist(h, onehot)
-            a = c_dist.sample()
-            logp = m_dist.log_prob(m) + c_dist.log_prob(a).sum(-1)
+            u = c_dist.rsample()
+            a = _squash(u)
+            logp = m_dist.log_prob(m) + _squash_log_prob(u, c_dist)
             return m, a, logp, self.critic(h).squeeze(-1)
 
         def act_with_maneuver(self, s, maneuver_idx):
             """Sample a control conditioned on a *given* maneuver (used by the
-            planner's per-group control beam). Returns (a, control_logp)."""
+            planner's per-group control beam). Returns (a, control_logp), `a`
+            already squashed to (-1, 1) and `control_logp` corrected for it."""
             h = self.features(s)
             m = torch.as_tensor(maneuver_idx, dtype=torch.long, device=h.device)
             if m.dim() == 0:
                 m = m.unsqueeze(0)
             onehot = F.one_hot(m, self.n_maneuvers).float()
             c_dist = self._control_dist(h, onehot)
-            a = c_dist.sample()
-            logp = c_dist.log_prob(a).sum(-1)
+            u = c_dist.rsample()
+            a = _squash(u)
+            logp = _squash_log_prob(u, c_dist)
             return a, logp
 
         # --- evaluation for PPO ---
         def evaluate(self, s, m, a):
-            """Batched. Returns (logp, entropy, value) for the joint (maneuver,
-            control) policy."""
+            """Batched. `a` is the SQUASHED action (in (-1,1)) as stored in the
+            rollout buffer. Returns (logp, entropy, value) for the joint
+            (maneuver, control) policy, with logp computed consistently under
+            the same squashed-Gaussian correction used at sampling time.
+
+            R8 · To evaluate log_prob(a) under the squashed distribution we
+            need the pre-squash u = atanh(a). `a` is clamped away from +/-1
+            first since PPO's training actions were generated by tanh and are
+            therefore strictly inside (-1,1) up to float precision, but stored/
+            reloaded values could in principle sit exactly on the boundary and
+            send atanh to +/-inf.
+            """
             h = self.features(s)
             m_dist = Categorical(logits=self.maneuver_head(h))
             onehot = F.one_hot(m.long(), self.n_maneuvers).float()
             c_dist = self._control_dist(h, onehot)
-            logp = m_dist.log_prob(m.long()) + c_dist.log_prob(a).sum(-1)
+            a_clamped = a.clamp(-1.0 + _TANH_EPS, 1.0 - _TANH_EPS)
+            u = torch.atanh(a_clamped)
+            logp = m_dist.log_prob(m.long()) + _squash_log_prob(u, c_dist)
+            # Entropy has no closed form for a squashed Gaussian; we use the
+            # pre-squash Normal entropy as in the standard SAC approximation
+            # (exact for the maneuver Categorical, approximate for control).
             entropy = m_dist.entropy() + c_dist.entropy().sum(-1)
             return logp, entropy, self.critic(h).squeeze(-1)
 
@@ -204,7 +275,7 @@ if HAS_TORCH:
                      hidden: int = 256, latent: int = 128):
             super().__init__()
             self.latent = latent
-            # R5 Â· normalise the encoder's input only; output heads (next_state,
+            # R5 · normalise the encoder's input only; output heads (next_state,
             # recon) stay in raw observation scale since their targets/losses
             # are computed against raw env states.
             self.obs_norm = RunningNorm(state_dim)
@@ -302,6 +373,7 @@ if HAS_TORCH:
 
         @torch.no_grad()
         def sample_action(self, state, maneuver):
+            # R8 · already squashed to (-1, 1) inside act_with_maneuver.
             a, logp = self.policy.act_with_maneuver(self._t(state), [int(maneuver)])
             return a.squeeze(0).cpu().numpy(), float(logp.item())
 
@@ -324,7 +396,7 @@ if HAS_TORCH:
 
         @torch.no_grad()
         def step(self, state, action, hidden=None):
-            # R1 Â· accept and propagate the GRU hidden state across imagined
+            # R1 · accept and propagate the GRU hidden state across imagined
             # steps. Without this, every imagined transition resets the
             # dynamics core to zero, defeating the point of using a GRU.
             h_in = None
@@ -357,7 +429,7 @@ if HAS_TORCH:
     # 4.  Losses  (base PPO + auxiliary/dream losses, Sec. 8)
     # ==========================================================================
     def _risk_shaped_reward(reward: float, info: dict, cfg: TrainConfig) -> float:
-        """C1/R4 Â· Optional risk-aware reward shaping applied to the real
+        """C1/R4 · Optional risk-aware reward shaping applied to the real
         environment step, on top of whatever risk term the env's own reward
         function already includes.
 
@@ -549,7 +621,7 @@ if HAS_TORCH:
                            if k in active_scn})
         progress0 = 0.0
         while buf.ptr < rollout_size:
-            # R5 Â· feed the real observed state into the running normalisers
+            # R5 · feed the real observed state into the running normalisers
             # so obs_norm actually tracks the true observation distribution
             # (only ever updated on real env states, never on imagined ones).
             obs_t = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device)
@@ -581,10 +653,10 @@ if HAS_TORCH:
                         velocity = a_data.get("velocity", [0.0, 0.0]),
                     )
 
-            # C1 Â· Risk-aware reward shaping on the real env reward
+            # C1 · Risk-aware reward shaping on the real env reward
             shaped_reward = _risk_shaped_reward(reward, step_info, cfg)
 
-            # C4 Â· intrinsic serendipity reward (Sec. 4.1): bounded so safety dominates
+            # C4 · intrinsic serendipity reward (Sec. 4.1): bounded so safety dominates
             # and never applied when a hard safety response was mandated.
             if not out["meta"].get("mandated", False):
                 ser = float(out["meta"].get("ser", 0.0))
@@ -649,7 +721,7 @@ if HAS_TORCH:
 
     def evaluate_agent(env, agent, eval_scenarios: list[dict],
                        episodes_per_scenario: int = 2) -> dict:
-        """C3 Â· Held-out evaluation, decoupled from the PER training bank.
+        """C3 · Held-out evaluation, decoupled from the PER training bank.
         Runs the *current* planner deterministically-ish on a fixed scenario
         battery and reports aggregate metrics. This is what you should actually
         trust when judging whether the agent generalises, since PER success/
@@ -741,8 +813,8 @@ if HAS_TORCH:
 
         start_it = 0
         if resume_path is not None:
-            print(f"[resume] Chargement du checkpoint complet depuis {resume_path} â€¦")
-            # R7 Â· PyTorch >= 2.6 defaults torch.load(weights_only=True), which
+            print(f"[resume] Chargement du checkpoint complet depuis {resume_path}...")
+            # R7 · PyTorch >= 2.6 defaults torch.load(weights_only=True), which
             # rejects checkpoints containing numpy RNG state (saved above for
             # exact resume). These checkpoints are produced by this same code
             # (trusted, not arbitrary downloads), so weights_only=False is safe
@@ -771,7 +843,7 @@ if HAS_TORCH:
             if ckpt.get("numpy_rng_state") is not None:
                 np.random.set_state(ckpt["numpy_rng_state"])
             start_it = int(ckpt.get("iteration", 0))
-            print(f"[resume] Reprise Ã  l'itÃ©ration {start_it}, tier={curriculum.stage}")
+            print(f"[resume] Reprise a l'iteration {start_it}, tier={curriculum.stage}")
 
         eval_scenarios = eval_scenarios or _default_eval_scenarios()
 
@@ -798,7 +870,7 @@ if HAS_TORCH:
                 for _ in range(64):
                     per.add(curriculum.sample_scenario_params())
 
-            # C3 Â· held-out evaluation, decoupled from the PER bank
+            # C3 · held-out evaluation, decoupled from the PER bank
             eval_stats = None
             if eval_every > 0 and (it + 1) % eval_every == 0:
                 eval_stats = evaluate_agent(env, agent, eval_scenarios,
@@ -879,6 +951,12 @@ class CarlaEnvAdapter:
       * ego_xy_fn(state) -> (x, y)            for conflict-cell diversity (Sec. 3)
       * mandated_action_fn(state, info)       the hard safety floor (Sec. 6):
             emergency brake when min_ttc < tau_safe, stop at red, etc.
+
+    Note on action range (R8): the policy now emits actions already squashed
+    to (-1, 1) via tanh, so a downstream adapter does NOT need to clip/squash
+    again -- but it DOES need to map that (-1,1) range to whatever physical
+    units the simulator expects (e.g. steer in radians, throttle/brake in
+    [0,1] if your sim doesn't use a symmetric range for those two channels).
 
     Mapping CARLA -> observation o_t = [e_t, l_t, m_t, r_t, v_t, p_t]:
       * e_t : ego kinematics (speed, accel, heading) from the CARLA ego sensors
