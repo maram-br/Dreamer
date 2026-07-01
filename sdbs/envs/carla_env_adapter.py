@@ -169,6 +169,8 @@ class CarlaEnvAdapter:
         # Stats épisode
         self.collisions  = 0
         self.near_misses = 0
+        self.ttc_violations = 0
+        self.ttc_threshold  = 3.0
 
     # ------------------------------------------------------------------
     # Interface publique
@@ -223,16 +225,23 @@ class CarlaEnvAdapter:
         self._col_hist    = []
         self.collisions   = 0
         self.near_misses  = 0
+        self.ttc_violations = 0
 
         self._last_obs  = self._build_obs()
         self._last_info = self._build_info(reward=0.0, done=False)
         return self._last_obs.copy()
 
-    def step(self, action: np.ndarray):
+    def step(self, action: np.ndarray, maneuver: Optional[int] = None):
         """
         action : np.ndarray shape (2,)
           action[0] = steering  ∈ [-1, 1]
           action[1] = accel     ∈ [-1, 1]  (<0 = frein)
+        maneuver : option discrète choisie par le planner (ignorée ici — la
+          dynamique CARLA n'est pilotée que par le contrôle continu). Ce
+          paramètre existe UNIQUEMENT pour rester signature-compatible avec
+          EnhancedMockEnv/MockDrivingEnv, que la boucle d'entraînement appelle
+          via env.step(action, maneuver). Sans lui, --mode carla plantait au
+          premier pas (TypeError: step() takes 2 positional arguments).
         """
         steer = float(np.clip(action[0], -1.0, 1.0))
         accel = float(np.clip(action[1], -1.0, 1.0))
@@ -255,6 +264,10 @@ class CarlaEnvAdapter:
         self._step_count += 1
 
         obs    = self._build_obs()
+        # comptage TTC : alimente la curriculum (métrique ttc_clean) et le PER
+        ttc = float(obs[8]) * TTC_INF
+        if len(self._vrus) > 0 and ttc < self.ttc_threshold:
+            self.ttc_violations += 1
         reward = self._compute_reward(obs, action)
         done   = self._is_done(obs)
         iinfo  = self._build_info(reward, done)
@@ -420,15 +433,34 @@ class CarlaEnvAdapter:
     def _build_info(self, reward: float, done: bool) -> dict:
         obs = self._last_obs
         ttc = float(obs[8]) * TTC_INF
+        occ = float(obs[9])
+        n_vru = len(self._vrus)
+
+        # distance au VRU le plus proche (obs[5],obs[6] sont rx,ry normalisés /50)
+        nearest_d = math.hypot(float(obs[5]), float(obs[6])) * 50.0 if n_vru else 99.0
+        vru_risk  = float(np.clip(math.exp(-nearest_d / 4.0), 0.0, 1.0)) if n_vru else 0.0
+        density   = float(np.clip(n_vru / 3.0 + occ * 0.3, 0.0, 1.0))
+        # progress = fraction de l'épisode parcourue sans collision (proxy de route)
+        progress  = float(np.clip(self._step_count / MAX_EPISODE_STEPS, 0.0, 1.0))
+
         return {
-            "min_ttc"    : ttc,
-            "collision"  : len(self._col_hist) > 0,
-            "near_misses": self.near_misses,
-            "collisions" : self.collisions,
-            "step"       : self._step_count,
-            "success"    : done and len(self._col_hist) == 0
-                           and self._step_count >= MAX_EPISODE_STEPS * 0.9,
-            "reward"     : reward,
+            "min_ttc"       : ttc,
+            "ttc_threshold" : self.ttc_threshold,
+            "n_vru"         : n_vru,
+            "occlusion"     : occ,
+            "uncertainty"   : occ * 0.6,
+            "collision"     : len(self._col_hist) > 0,
+            "near_misses"   : self.near_misses,
+            "collisions"    : self.collisions,
+            "ttc_violations": self.ttc_violations,
+            # cibles pour les têtes du world model (sinon entraînées sur des zéros)
+            "vru_risk"      : vru_risk,
+            "density"       : density,
+            "progress"      : progress,
+            "step"          : self._step_count,
+            "success"       : done and len(self._col_hist) == 0
+                              and self._step_count >= MAX_EPISODE_STEPS * 0.9,
+            "reward"        : reward,
         }
 
     # ------------------------------------------------------------------

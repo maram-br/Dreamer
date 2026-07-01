@@ -471,14 +471,36 @@ if HAS_TORCH:
         return dict(loss_pi=float(loss_pi.item()), loss_v=float(loss_v.item()),
                     entropy=float(entropy.mean().item()))
 
+    def _whiten(wm, x):
+        """Rescale an observation-scale tensor with the world model's own running
+        stats (detached, so it only reshapes the loss geometry and does not
+        backprop into the normaliser). Without this, next_state/recon MSE is
+        dominated by the large-magnitude dims (vru_dx, min_ttc reach ~99) and the
+        safety-critical [0,1] dims (visibility, occlusion, small-TTC) receive
+        ~10^4x weaker gradients -- the WM learns geometry but ignores VRU danger.
+
+        The std is floored at 1.0 so this can only ever *down-weight* wide dims,
+        never *up-weight* narrow/near-constant ones. That floor is essential:
+        dims that stay constant in a tier (e.g. unused VRU slots pinned at 99)
+        have running variance -> 0, and naively dividing by sqrt(var) blows their
+        contribution up ~100x and makes the loss diverge.
+        """
+        mean = wm.obs_norm.mean.detach()
+        std = torch.sqrt(wm.obs_norm.var).detach().clamp(min=1.0)
+        return (x - mean) / std
+
     def world_model_update(wm, optimizer, batch, cfg: TrainConfig):
         out = wm(batch["states"], batch["actions"])
         scene = wm.scene(batch["states"])
-        loss_state = F.mse_loss(out["next_state"], batch["next_states"])
+        # next_state / recon losses computed in whitened space so every
+        # observation dimension contributes comparable gradient (see _whiten).
+        loss_state = F.mse_loss(_whiten(wm, out["next_state"]),
+                                _whiten(wm, batch["next_states"]))
         loss_reward = F.mse_loss(out["reward"], batch["rewards"])
         loss_risk = F.mse_loss(out["risk"], batch["risk_targets"])
         loss_progress = F.mse_loss(out["progress"], batch["progress_targets"])
-        loss_recon = F.mse_loss(scene["recon"], batch["states"])      # autoencoder grounding
+        loss_recon = F.mse_loss(_whiten(wm, scene["recon"]),
+                                _whiten(wm, batch["states"]))      # autoencoder grounding
         loss_density = F.mse_loss(scene["density"], batch["density_targets"])
         loss = (cfg.beta_dream * loss_state
                 + loss_reward
@@ -503,7 +525,8 @@ if HAS_TORCH:
         for m in ensemble.models:
             idx = torch.randint(0, n, (n,), device=batch["states"].device)
             out = m(batch["states"][idx], batch["actions"][idx])
-            loss = (F.mse_loss(out["next_state"], batch["next_states"][idx])
+            loss = (F.mse_loss(_whiten(m, out["next_state"]),
+                               _whiten(m, batch["next_states"][idx]))
                     + F.mse_loss(out["risk"], batch["risk_targets"][idx]))
             loss.backward()
             total += float(loss.item())
