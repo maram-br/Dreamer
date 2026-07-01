@@ -5,9 +5,17 @@ Drop-in replacement for EnhancedMockEnv that wraps a live CARLA server.
 
 Interface identique à EnhancedMockEnv :
   - reset(tier, n_vru, occlusion_prob, adversarial) -> np.ndarray
-  - step(action)  -> (obs, reward, done, info)
+  - step(action, maneuver=None)  -> (obs, reward, done, info)
   - info()        -> dict
   - state_dim, action_dim
+
+⚠️ Layout d'observation : 20-dim / action 3-dim [steer, throttle, brake],
+EXACTEMENT le même que EnhancedMockEnv et carla_obs_utils.extract_observation.
+C'est ce qui rend le hand-off mock -> CARLA réellement transparent : un
+WorldModel pré-entraîné sur des logs CARLA (collect_carla_driving_data.py ->
+pretrain_world_model_offline.py) se charge sans mismatch de dimension via
+build_agent(wm_state=...), et enhanced_ego_xy / enhanced_mandated_action
+transfèrent tels quels (réutilisés ci-dessous).
 
 Dépendances :
   pip install carla numpy
@@ -21,7 +29,6 @@ Usage depuis run_training.py :
 from __future__ import annotations
 
 import math
-import os
 import random
 import time
 from typing import Optional
@@ -36,48 +43,43 @@ except ImportError:
     # Permet d'importer le module sans CARLA installé (ex: CI)
     # Une erreur claire sera levée à l'instanciation.
 
-# ---------------------------------------------------------------------------
-# Dimensions — doivent correspondre à celles d'EnhancedMockEnv
-# ---------------------------------------------------------------------------
-# obs = [ego_x, ego_y, ego_vx, ego_vy, ego_yaw,        (5)
-#         nearest_vru_rx, nearest_vru_ry, nearest_vru_v, (3)
-#         ttc, occlusion_flag,                           (2)
-#         road_curvature, speed_limit_norm,              (2)
-#         vru1_rx, vru1_ry, vru2_rx, vru2_ry,           (4)
-#         lateral_offset, heading_error]                 (2)
-#                                                  total = 18
-CARLA_STATE_DIM  = 18
-CARLA_ACTION_DIM = 2   # [steering (-1..1), accel (-1..1) : <0 = freinage]
+# L'extraction d'observation ET le layout 20-dim sont partagés avec la collecte
+# de données (carla_obs_utils) : une seule source de vérité pour le layout.
+from sdbs.envs.carla_obs_utils import (
+    RouteTracker, extract_observation,
+    CARLA_STATE_DIM, CARLA_ACTION_DIM,
+    IDX_EGO_X, IDX_EGO_Y, IDX_SPEED, IDX_LANE_OFF, IDX_TL,
+    IDX_MIN_TTC, IDX_OCC, IDX_VRU0_DX, IDX_VRU0_VIS, IDX_PROGRESS,
+)
+# Le layout étant identique à EnhancedMockEnv, on réutilise directement sa
+# fonction ego_xy et son safety-floor mandaté (pas de duplication).
+from sdbs.envs.enhanced_mock_env import (
+    enhanced_ego_xy, enhanced_mandated_action,
+)
 
 # Constantes physiques / capteurs
 MAX_SPEED_MS      = 14.0   # ~50 km/h
-COLLISION_RADIUS  = 2.5    # mètres  — détection proximité VRU
-TTC_INF           = 10.0   # valeur sentinelle si pas de conflit
+TTC_THRESHOLD     = 3.0    # seuil de violation TTC (aligné sur EnhancedMockEnv)
 MAX_EPISODE_STEPS = 300
 SPAWN_RADIUS      = 40.0   # rayon autour de l'ego pour spawner les VRU
+OCCLUSION_REVEAL_DX = 7.0  # m : un VRU occlus scénarisé se révèle sous cette distance
 
 
 # ==============================================================================
 # Fonctions compagnes (même rôle que enhanced_ego_xy / enhanced_mandated_action)
+# Le layout étant identique, on délègue aux versions EnhancedMockEnv pour éviter
+# toute divergence de comportement entre mock et CARLA.
 # ==============================================================================
 
 def carla_ego_xy(obs: np.ndarray):
-    """Extrait (x, y) de l'observation vectorielle."""
-    return float(obs[0]), float(obs[1])
+    """(x, y) route-relatifs pour la diversité conflict-cell (Sec. 3)."""
+    return enhanced_ego_xy(obs)
 
 
 def carla_mandated_action(obs: np.ndarray, info: dict) -> Optional[np.ndarray]:
-    """
-    Retourne une action imposée si la sécurité l'exige, sinon None.
-    Le planner S-DBS appellera cette fonction à chaque pas.
-    """
-    ttc = float(obs[8])
-    if ttc < 1.5:
-        # Freinage d'urgence
-        return np.array([0.0, -1.0], dtype=np.float32)
-    if info.get("collision", False):
-        return np.array([0.0, -1.0], dtype=np.float32)
-    return None
+    """Safety-floor imposé (freinage d'urgence / feu rouge / priorité).
+    Retourne une action 3-dim [steer, throttle, brake] ou None."""
+    return enhanced_mandated_action(obs, info)
 
 
 # ==============================================================================
@@ -87,11 +89,12 @@ def carla_mandated_action(obs: np.ndarray, info: dict) -> Optional[np.ndarray]:
 class CarlaEnvAdapter:
     """
     Wraps a CARLA server as a gym-like environment compatible avec
-    EnhancedMockEnv (même state_dim, action_dim, reset/step/info).
+    EnhancedMockEnv (même state_dim=20, action_dim=3, reset/step/info).
     """
 
-    state_dim  = CARLA_STATE_DIM
-    action_dim = CARLA_ACTION_DIM
+    state_dim  = CARLA_STATE_DIM     # 20
+    action_dim = CARLA_ACTION_DIM    # 3  -> [steer, throttle, brake]
+    n_maneuvers = 6                  # doit matcher len(Maneuver) dans sdbs_core
 
     # ------------------------------------------------------------------
     def __init__(
@@ -119,6 +122,7 @@ class CarlaEnvAdapter:
         self.render = render
         self.fixed_dt = fixed_delta_seconds
         self.town   = town
+        self.ttc_threshold = TTC_THRESHOLD
 
         self._rng = np.random.default_rng(seed)
         random.seed(seed)
@@ -148,12 +152,16 @@ class CarlaEnvAdapter:
         self._ego       : Optional[carla.Vehicle]    = None
         self._vrus      : list[carla.Walker]         = []
         self._vru_ctrls : list[carla.WalkerAIController] = []
+        self._vehicles  : list[carla.Vehicle]        = []   # occluders (pour extract_observation)
         self._sensors   : list                       = []
+        self._route     : Optional[RouteTracker]     = None
+        self._traffic_lights : list                  = []
 
         # État interne
         self._step_count  = 0
         self._collision   = False
         self._lane_inv    = False
+        self._occluded    = False   # occlusion scénarisée (greedy trap), tirée par épisode
         self._last_obs    = np.zeros(CARLA_STATE_DIM, dtype=np.float32)
         self._last_info   : dict = {}
 
@@ -167,10 +175,9 @@ class CarlaEnvAdapter:
         self._adversarial   = False
 
         # Stats épisode
-        self.collisions  = 0
-        self.near_misses = 0
+        self.collisions     = 0
+        self.near_misses    = 0
         self.ttc_violations = 0
-        self.ttc_threshold  = 3.0
 
     # ------------------------------------------------------------------
     # Interface publique
@@ -183,7 +190,7 @@ class CarlaEnvAdapter:
         occlusion_prob: float = 0.0,
         adversarial: bool = False,
     ) -> np.ndarray:
-        """Réinitialise l'épisode et retourne l'obs initiale."""
+        """Réinitialise l'épisode et retourne l'obs initiale (20-dim)."""
         self._tier        = tier
         self._n_vru       = n_vru
         self._occlusion_p = occlusion_prob
@@ -219,6 +226,14 @@ class CarlaEnvAdapter:
         for _ in range(10):
             self._world.tick()
 
+        # Route (pour progress / lane-offset via carla_obs_utils) + feux de la carte
+        self._build_route()
+        self._traffic_lights = list(
+            self._world.get_actors().filter("traffic.traffic_light"))
+
+        # Occlusion scénarisée tirée une fois par épisode (greedy trap)
+        self._occluded = bool(self._rng.random() < occlusion_prob)
+
         self._step_count  = 0
         self._collision   = False
         self._lane_inv    = False
@@ -233,183 +248,117 @@ class CarlaEnvAdapter:
 
     def step(self, action: np.ndarray, maneuver: Optional[int] = None):
         """
-        action : np.ndarray shape (2,)
-          action[0] = steering  ∈ [-1, 1]
-          action[1] = accel     ∈ [-1, 1]  (<0 = frein)
-        maneuver : option discrète choisie par le planner (ignorée ici — la
-          dynamique CARLA n'est pilotée que par le contrôle continu). Ce
-          paramètre existe UNIQUEMENT pour rester signature-compatible avec
-          EnhancedMockEnv/MockDrivingEnv, que la boucle d'entraînement appelle
-          via env.step(action, maneuver). Sans lui, --mode carla plantait au
-          premier pas (TypeError: step() takes 2 positional arguments).
+        action : np.ndarray shape (3,)  -> [steer, throttle, brake]
+          steer    ∈ [-1, 1]
+          throttle ∈ [0, 1]   (valeurs négatives clampées à 0)
+          brake    ∈ [0, 1]   (valeurs négatives clampées à 0)
+        maneuver : option discrète du planner (ignorée ici — la dynamique CARLA
+          n'est pilotée que par le contrôle continu). Présent uniquement pour
+          rester signature-compatible avec EnhancedMockEnv/MockDrivingEnv, que
+          la boucle d'entraînement appelle via env.step(action, maneuver).
         """
-        steer = float(np.clip(action[0], -1.0, 1.0))
-        accel = float(np.clip(action[1], -1.0, 1.0))
+        a = np.asarray(action, np.float32).reshape(-1)
+        steer    = float(np.clip(a[0], -1.0, 1.0))
+        throttle = float(np.clip(a[1],  0.0, 1.0))
+        brake    = float(np.clip(a[2],  0.0, 1.0))
 
-        if accel >= 0.0:
-            ctrl = carla.VehicleControl(
-                throttle = accel,
-                steer    = steer,
-                brake    = 0.0,
-            )
-        else:
-            ctrl = carla.VehicleControl(
-                throttle = 0.0,
-                steer    = steer,
-                brake    = -accel,
-            )
-
+        ctrl = carla.VehicleControl(throttle=throttle, steer=steer, brake=brake)
         self._ego.apply_control(ctrl)
         self._world.tick()
         self._step_count += 1
 
-        obs    = self._build_obs()
-        # comptage TTC : alimente la curriculum (métrique ttc_clean) et le PER
-        ttc = float(obs[8]) * TTC_INF
+        obs = self._build_obs()
+
+        # comptage sécurité (alimente reward, curriculum ttc_clean, et PER)
+        ttc   = float(obs[IDX_MIN_TTC])
+        speed = float(obs[IDX_SPEED])
+        near_miss = (len(self._vrus) > 0 and ttc < 1.5 and speed > 2.0)
         if len(self._vrus) > 0 and ttc < self.ttc_threshold:
             self.ttc_violations += 1
-        reward = self._compute_reward(obs, action)
+        if near_miss:
+            self.near_misses += 1
+
+        reward = self._compute_reward(obs, np.array([steer, throttle, brake]),
+                                      near_miss)
         done   = self._is_done(obs)
-        iinfo  = self._build_info(reward, done)
 
         self._last_obs  = obs
-        self._last_info = iinfo
-        return obs.copy(), reward, done, iinfo
+        self._last_info = self._build_info(reward, done)
+        return obs.copy(), float(reward), bool(done), self._last_info
 
     def info(self) -> dict:
         return self._last_info.copy()
 
     # ------------------------------------------------------------------
-    # Construction de l'observation
+    # Construction de l'observation  (délègue au layout 20-dim partagé)
     # ------------------------------------------------------------------
 
     def _build_obs(self) -> np.ndarray:
-        obs = np.zeros(CARLA_STATE_DIM, dtype=np.float32)
-        if self._ego is None:
-            return obs
+        if self._ego is None or self._route is None:
+            return np.zeros(CARLA_STATE_DIM, dtype=np.float32)
 
-        t   = self._ego.get_transform()
-        v   = self._ego.get_velocity()
-        yaw = math.radians(t.rotation.yaw)
+        obs = extract_observation(
+            self._world, self._ego, self._route,
+            self._vrus, self._vehicles, self._traffic_lights,
+        )
 
-        ego_x  = t.location.x
-        ego_y  = t.location.y
-        ego_vx = v.x
-        ego_vy = v.y
-
-        obs[0] = ego_x  / 100.0   # normalisation grossière
-        obs[1] = ego_y  / 100.0
-        obs[2] = ego_vx / MAX_SPEED_MS
-        obs[3] = ego_vy / MAX_SPEED_MS
-        obs[4] = yaw    / math.pi
-
-        # VRU le plus proche
-        min_dist = float("inf")
-        nearest_rv = np.zeros(3)
-        vru_slots  = np.zeros(4)   # 2 VRU × (rx, ry)
-
-        for i, vru in enumerate(self._vrus[:2]):
-            vt  = vru.get_transform()
-            vv  = vru.get_velocity()
-            rx  = (vt.location.x - ego_x) / 50.0
-            ry  = (vt.location.y - ego_y) / 50.0
-            spd = math.hypot(vv.x, vv.y) / 2.0   # piéton ~1-2 m/s
-
-            d = math.hypot(rx, ry) * 50.0
-            if d < min_dist:
-                min_dist   = d
-                nearest_rv = np.array([rx, ry, spd])
-
-            vru_slots[2*i]   = rx
-            vru_slots[2*i+1] = ry
-
-        obs[5] = nearest_rv[0]
-        obs[6] = nearest_rv[1]
-        obs[7] = nearest_rv[2]
-
-        # TTC simplifié : distance / vitesse relative radiale
-        ego_spd = math.hypot(ego_vx, ego_vy)
-        if min_dist < 50.0 and ego_spd > 0.5:
-            ttc = min(min_dist / max(ego_spd, 0.1), TTC_INF)
-        else:
-            ttc = TTC_INF
-        obs[8] = ttc / TTC_INF
-
-        # Occlusion (stochastique selon le tier)
-        obs[9] = float(self._rng.random() < self._occlusion_p)
-
-        # Road curvature (approximation via waypoint)
-        wp = self._world.get_map().get_waypoint(t.location)
-        next_wps = wp.next(5.0)
-        if next_wps:
-            nwp   = next_wps[0]
-            dyaw  = math.radians(nwp.transform.rotation.yaw - t.rotation.yaw)
-            dyaw  = (dyaw + math.pi) % (2 * math.pi) - math.pi
-            obs[10] = dyaw / math.pi
-        else:
-            obs[10] = 0.0
-
-        # Speed limit
-        spd_lim = wp.speed_limit if hasattr(wp, "speed_limit") else 50.0
-        obs[11] = min(spd_lim / 3.6, MAX_SPEED_MS) / MAX_SPEED_MS
-
-        # VRU slots
-        obs[12] = vru_slots[0]
-        obs[13] = vru_slots[1]
-        obs[14] = vru_slots[2]
-        obs[15] = vru_slots[3]
-
-        # Lateral offset & heading error
-        lane_center = wp.transform.location
-        lane_yaw    = math.radians(wp.transform.rotation.yaw)
-        dx = ego_x - lane_center.x
-        dy = ego_y - lane_center.y
-        lat_off = -dx * math.sin(lane_yaw) + dy * math.cos(lane_yaw)
-        head_err = yaw - lane_yaw
-        head_err = (head_err + math.pi) % (2 * math.pi) - math.pi
-        obs[16] = lat_off   / 3.0
-        obs[17] = head_err  / math.pi
-
+        # Occlusion scénarisée (greedy trap) : tant que le VRU le plus proche
+        # reste loin, on le masque ; il se révèle quand l'ego s'approche
+        # (< OCCLUSION_REVEAL_DX), comme dans EnhancedMockEnv.
+        if self._occluded and len(self._vrus) > 0:
+            if float(obs[IDX_VRU0_DX]) > OCCLUSION_REVEAL_DX:
+                obs[IDX_OCC]      = 1.0
+                obs[IDX_VRU0_VIS] = 0.0
         return obs
 
     # ------------------------------------------------------------------
-    # Reward
+    # Route : polyligne de waypoints devant l'ego (progress + lane offset)
     # ------------------------------------------------------------------
 
-    def _compute_reward(self, obs: np.ndarray, action: np.ndarray) -> float:
-        r = 0.0
+    def _build_route(self):
+        map_ = self._world.get_map()
+        start_wp = map_.get_waypoint(self._ego.get_location())
+        wps = [start_wp]
+        cur = start_wp
+        for _ in range(200):
+            nxt = cur.next(2.0)
+            if not nxt:
+                break
+            cur = nxt[0]
+            wps.append(cur)
+        self._route = RouteTracker(waypoints=wps, route_len_m=2.0 * len(wps))
 
-        # 1. Vitesse : récompense de progresser
-        ego_spd = math.hypot(
-            self._ego.get_velocity().x,
-            self._ego.get_velocity().y,
-        )
-        spd_norm = ego_spd / MAX_SPEED_MS
-        r += 0.3 * spd_norm
+    # ------------------------------------------------------------------
+    # Reward  (mêmes termes/échelle que EnhancedMockEnv._reward, pour que le
+    # reward-shaping et le curriculum se transfèrent du mock à CARLA)
+    # ------------------------------------------------------------------
 
-        # 2. Sécurité VRU
-        ttc = float(obs[8]) * TTC_INF
-        if ttc < 2.0:
-            r -= 0.5 * (2.0 - ttc) / 2.0   # pénalité progressive
+    def _compute_reward(self, obs: np.ndarray, action: np.ndarray,
+                        near_miss: bool) -> float:
+        steer, _throttle, brake = float(action[0]), float(action[1]), float(action[2])
+        speed = float(obs[IDX_SPEED])
+        dist  = speed * self.fixed_dt   # progression approx. sur ce pas (m)
 
-        # 3. Collision détectée par le capteur
-        if self._collision:
-            r -= 5.0
+        r_prog      =  dist / 8.0
+        collision   = len(self._col_hist) > 0
+        r_collision = -20.0 if collision else 0.0
+        r_near_miss =  -4.0 if near_miss else 0.0
+
+        ttc = float(obs[IDX_MIN_TTC])
+        r_ttc = 0.0
+        if len(self._vrus) > 0 and ttc < self.ttc_threshold:
+            r_ttc = -2.0 * (1.0 - ttc / self.ttc_threshold)
+
+        r_comfort = -0.05 * (abs(steer) + abs(brake))
+        r_tl      = -5.0 if (float(obs[IDX_TL]) > 0.5 and speed > 1.0) else 0.0
+        r_lane    = -0.2 * abs(float(obs[IDX_LANE_OFF]))
+
+        if collision:
             self.collisions += 1
-            self._collision = False
+            self._col_hist = []   # consommé (une collision comptée une fois)
 
-        # 4. Near-miss
-        if ttc < 1.0:
-            self.near_misses += 1
-
-        # 5. Tenue de voie
-        lat_off = float(obs[16]) * 3.0
-        r -= 0.1 * abs(lat_off)
-
-        # 6. Confort : pénalité sur les actions brusques
-        r -= 0.05 * (abs(action[0]) + max(0.0, -action[1]))
-
-        return float(r)
+        return float(r_prog + r_collision + r_near_miss + r_ttc
+                     + r_comfort + r_tl + r_lane)
 
     # ------------------------------------------------------------------
     # Done
@@ -418,30 +367,28 @@ class CarlaEnvAdapter:
     def _is_done(self, obs: np.ndarray) -> bool:
         if self._step_count >= MAX_EPISODE_STEPS:
             return True
-        # Collision grave
-        if len(self._col_hist) > 0:
+        if len(self._col_hist) > 0:          # collision non encore consommée
             return True
-        # Hors route (lateral offset trop grand)
-        if abs(float(obs[16]) * 3.0) > 3.0:
+        if float(obs[IDX_PROGRESS]) >= 1.0:  # route terminée
+            return True
+        if abs(float(obs[IDX_LANE_OFF])) > 3.0:  # sortie de voie
             return True
         return False
 
     # ------------------------------------------------------------------
-    # Info dict
+    # Info dict  (mêmes clés que EnhancedMockEnv._build_info)
     # ------------------------------------------------------------------
 
     def _build_info(self, reward: float, done: bool) -> dict:
-        obs = self._last_obs
-        ttc = float(obs[8]) * TTC_INF
-        occ = float(obs[9])
+        obs   = self._last_obs
+        ttc   = float(obs[IDX_MIN_TTC])
+        occ   = float(obs[IDX_OCC])
         n_vru = len(self._vrus)
 
-        # distance au VRU le plus proche (obs[5],obs[6] sont rx,ry normalisés /50)
-        nearest_d = math.hypot(float(obs[5]), float(obs[6])) * 50.0 if n_vru else 99.0
-        vru_risk  = float(np.clip(math.exp(-nearest_d / 4.0), 0.0, 1.0)) if n_vru else 0.0
-        density   = float(np.clip(n_vru / 3.0 + occ * 0.3, 0.0, 1.0))
-        # progress = fraction de l'épisode parcourue sans collision (proxy de route)
-        progress  = float(np.clip(self._step_count / MAX_EPISODE_STEPS, 0.0, 1.0))
+        nearest_dx = float(obs[IDX_VRU0_DX]) if n_vru else 99.0
+        vru_risk   = float(np.clip(math.exp(-nearest_dx / 4.0), 0.0, 1.0)) if n_vru else 0.0
+        density    = float(np.clip(n_vru / 3.0 + occ * 0.3, 0.0, 1.0))
+        progress   = float(obs[IDX_PROGRESS])
 
         return {
             "min_ttc"       : ttc,
@@ -453,13 +400,15 @@ class CarlaEnvAdapter:
             "near_misses"   : self.near_misses,
             "collisions"    : self.collisions,
             "ttc_violations": self.ttc_violations,
-            # cibles pour les têtes du world model (sinon entraînées sur des zéros)
+            # cibles des têtes du world model (sinon entraînées sur des zéros)
             "vru_risk"      : vru_risk,
             "density"       : density,
             "progress"      : progress,
             "step"          : self._step_count,
-            "success"       : done and len(self._col_hist) == 0
-                              and self._step_count >= MAX_EPISODE_STEPS * 0.9,
+            "success"       : bool(progress >= 1.0 and self.collisions == 0
+                                   and self.near_misses == 0),
+            "scenario"      : ("ADVERSARIAL" if self._adversarial
+                               else ("OCCLUDED_PED" if self._occluded else "CLEAR")),
             "reward"        : reward,
         }
 
@@ -573,7 +522,6 @@ class CarlaEnvAdapter:
         friction_val = self._rng.uniform(0.6, 1.0)
         friction_bp  = self._bp_lib.find("static.trigger.friction")
         extent = carla.Location(5.0, 5.0, 5.0)
-        transform = self._ego.get_transform()
         friction_bp.set_attribute("friction",    str(friction_val))
         friction_bp.set_attribute("extent_x",    str(extent.x))
         friction_bp.set_attribute("extent_y",    str(extent.y))
@@ -605,6 +553,13 @@ class CarlaEnvAdapter:
             except Exception:
                 pass
         self._vrus = []
+
+        for v in self._vehicles:
+            try:
+                v.destroy()
+            except Exception:
+                pass
+        self._vehicles = []
 
         for s in self._sensors:
             try:
