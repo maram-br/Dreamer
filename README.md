@@ -41,7 +41,13 @@ scp -r sdbsv2/ user@serveur:/chemin/vers/sdbsv2/
 ssh user@serveur
 cd /chemin/vers/sdbsv2/
 pip install -r requirements.txt   # numpy / torch / pygame (pygame optionnel sur le serveur)
+pip install -e .                  # OBLIGATOIRE : rend le package `sdbs` importable
+                                  # (sinon les scripts échouent avec
+                                  #  ModuleNotFoundError: No module named 'sdbs')
 ```
+
+> À défaut de `pip install -e .`, préfixe chaque commande par `PYTHONPATH=.`
+> (les scripts n'ajoutent que `scripts/` au path, pas la racine du dépôt).
 
 ### 3. Collecter de la conduite "normale" via le Traffic Manager (autopilote)
 
@@ -76,8 +82,8 @@ python scripts/run_training.py \
     --wm_checkpoint checkpoints/wm_pretrained_carla.pt \
     --iters 1000 \
     --eval_every 25 \
-    --save_every 50 --save_path checkpoints/sdbs_checkpoint.pt
-    --traffic_predictor  
+    --save_every 50 --save_path checkpoints/sdbs_checkpoint.pt \
+    --traffic_predictor
 ```
 
 
