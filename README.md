@@ -42,8 +42,6 @@ ssh user@serveur
 cd /chemin/vers/sdbsv2/
 pip install -r requirements.txt   # numpy / torch / pygame (pygame optionnel sur le serveur)
 pip install -e .                  # OBLIGATOIRE : rend le package `sdbs` importable
-                                  # (sinon les scripts échouent avec
-                                  #  ModuleNotFoundError: No module named 'sdbs')
 ```
 
 > À défaut de `pip install -e .`, préfixe chaque commande par `PYTHONPATH=.`
@@ -51,9 +49,6 @@ pip install -e .                  # OBLIGATOIRE : rend le package `sdbs` importa
 
 ### 3. Collecter de la conduite "normale" via le Traffic Manager (autopilote)
 
-Pas besoin d'agent entraîné — le Traffic Manager pilote l'ego pendant que le
-script enregistre les transitions dans le layout 20-dim compatible avec
-`EnhancedMockEnv`.
 
 ```bash
 python scripts/collect_carla_driving_data.py \
